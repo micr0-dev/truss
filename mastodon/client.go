@@ -134,6 +134,11 @@ func (c *Client) GetNewPosts(ctx context.Context, sinceID string, sinceTime time
 
 			reblogIsReply := status.Reblog.InReplyToID != ""
 
+			// Add these fields for reblogged content
+			reblogUsername := status.Reblog.Account.Username
+			reblogInstance := extractInstanceFromAcct(status.Reblog.Account.Acct, c.client.Config.Server)
+			reblogDisplayName := status.Reblog.Account.DisplayName
+
 			post.Reblog = &Post{
 				ID:         string(status.Reblog.ID),
 				Content:    cleanHTML(status.Reblog.Content, reblogHashtags, reblogIsReply),
@@ -147,7 +152,10 @@ func (c *Client) GetNewPosts(ctx context.Context, sinceID string, sinceTime time
 					}
 					return ""
 				}(),
-				Hashtags: reblogHashtags,
+				Hashtags:    reblogHashtags,
+				Username:    reblogUsername,
+				Instance:    reblogInstance,
+				DisplayName: reblogDisplayName,
 			}
 		}
 

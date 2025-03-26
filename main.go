@@ -193,15 +193,18 @@ func (b *Bridge) Run(ctx context.Context) error {
 }
 
 func (b *Bridge) ProcessPost(ctx context.Context, post *mastodon.Post) error {
-	// Skip boosts/reblogs for now
 	if post.Reblog != nil {
-		log.Printf("Skipping reblog: %s", post.ID)
-		return nil
+		return b.ProcessReblog(ctx, post)
 	}
 
 	// Skip non-public posts
 	if post.Visibility != "public" {
 		log.Printf("Skipping non-public post: %s (visibility: %s)", post.ID, post.Visibility)
+		return nil
+	}
+
+	if post.Content == "" {
+		log.Printf("Skipping post with empty content: %s", post.ID)
 		return nil
 	}
 
@@ -325,6 +328,11 @@ func (b *Bridge) ProcessPost(ctx context.Context, post *mastodon.Post) error {
 			part = part[:297] + "..."
 		}
 
+		if part == "" {
+			log.Printf("WARNING: Skipping empty post content (part %d)", i+1)
+			continue
+		}
+
 		var result string
 		var err error
 
@@ -379,6 +387,108 @@ func (b *Bridge) ProcessPost(ctx context.Context, post *mastodon.Post) error {
 	// Store the content hash
 	if err := b.db.SaveContentHash(post.ID, contentHash); err != nil {
 		log.Printf("Error saving content hash: %v", err)
+	}
+
+	return nil
+}
+
+func (b *Bridge) ProcessReblog(ctx context.Context, post *mastodon.Post) error {
+	// Skip non-public posts
+	if post.Visibility != "public" || post.Reblog.Visibility != "public" {
+		log.Printf("Skipping non-public reblog: %s (visibility: %s/%s)",
+			post.ID, post.Visibility, post.Reblog.Visibility)
+		return nil
+	}
+
+	// Skip if reblog is nil or has empty content
+	if post.Reblog == nil || post.Reblog.Content == "" {
+		log.Printf("Skipping reblog with empty content: %s", post.ID)
+		return nil
+	}
+
+	// Filter hashtags if needed
+	if b.config.FilterHashtag != "" {
+		hasFilterTag := false
+		for _, tag := range post.Reblog.Hashtags {
+			if strings.EqualFold(tag, b.config.FilterHashtag) {
+				hasFilterTag = true
+				break
+			}
+		}
+
+		if !hasFilterTag {
+			log.Printf("Skipping reblog %s without required hashtag #%s", post.ID, b.config.FilterHashtag)
+			return nil
+		}
+	}
+
+	// Track reblog with content hash
+	contentHash := hashPostContent(post.Reblog.ID + ":" + post.Reblog.Content)
+
+	// Check if already processed
+	existingHash, err := b.db.GetContentHash(post.ID)
+	if err == nil && existingHash == contentHash {
+		log.Printf("Reblog %s unchanged (hash: %s), skipping", post.ID, contentHash[:8])
+		return nil
+	}
+
+	// If detecting a change to empty content, don't delete the original
+	if existingHash != "" && post.Reblog.Content == "" {
+		log.Printf("Reblog %s was edited to empty content, preserving original", post.ID)
+		return nil
+	}
+
+	// Clean up existing posts if content changed
+	if existingHash != "" {
+		bskyIDs, err := b.db.GetBlueskyIDsForMastodonPost(post.ID)
+		if err == nil && len(bskyIDs) > 0 {
+			for _, id := range bskyIDs {
+				if err := b.bluesky.DeletePost(ctx, id); err != nil {
+					log.Printf("Error deleting Bluesky post %s: %v", id, err)
+				}
+			}
+		}
+	}
+
+	// Try to find original post on Bluesky
+	var originalUri, originalCid string
+	var lookupErr error
+
+	if post.Reblog.Username != "" && post.Reblog.Instance != "" {
+		log.Printf("Looking for original post %s by %s@%s on Bluesky",
+			post.Reblog.ID, post.Reblog.Username, post.Reblog.Instance)
+
+		originalUri, originalCid, lookupErr = b.bluesky.LookupBridgedMastodonPost(
+			ctx,
+			post.Reblog.ID,
+			post.Reblog.Username,
+			post.Reblog.Instance,
+			post.Reblog.Content,
+			post.Reblog.DisplayName,
+			post.Reblog.CreatedAt)
+	}
+
+	// If found, create a proper repost; otherwise skip
+	if lookupErr == nil && originalUri != "" && originalCid != "" {
+		log.Printf("Found original post on Bluesky, creating repost: %s", originalUri)
+
+		result, err := b.bluesky.CreateRepost(ctx, originalUri, originalCid)
+		if err != nil {
+			log.Printf("Error creating Bluesky repost: %v", err)
+			return err
+		}
+
+		// Save mapping and content hash
+		if err := b.db.SavePostMapping(post.ID, []string{result}); err != nil {
+			log.Printf("Error saving post mapping: %v", err)
+		}
+
+		if err := b.db.SaveContentHash(post.ID, contentHash); err != nil {
+			log.Printf("Error saving content hash: %v", err)
+		}
+	} else {
+		// Skip if original post not found
+		log.Printf("Original post not found on Bluesky, skipping reblog")
 	}
 
 	return nil

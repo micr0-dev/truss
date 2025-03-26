@@ -707,3 +707,61 @@ func (c *Client) searchForPost(ctx context.Context, searchTerm, mastodonPostID s
 
 	return "", "", fmt.Errorf("no matching post found in search results")
 }
+
+func (c *Client) CreateRepost(ctx context.Context, uri string, cid string) (string, error) {
+	if err := c.ensureAuth(ctx); err != nil {
+		return "", fmt.Errorf("authentication failed: %w", err)
+	}
+
+	// Create repost record
+	record := map[string]interface{}{
+		"$type": "app.bsky.feed.repost",
+		"subject": map[string]interface{}{
+			"cid": cid,
+			"uri": uri,
+		},
+		"createdAt": time.Now().Format(time.RFC3339),
+	}
+
+	req := map[string]interface{}{
+		"repo":       c.did,
+		"collection": "app.bsky.feed.repost",
+		"record":     record,
+	}
+
+	reqBody, err := json.Marshal(req)
+	if err != nil {
+		return "", fmt.Errorf("marshaling repost request: %w", err)
+	}
+
+	url := c.pds + "/xrpc/com.atproto.repo.createRecord"
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(reqBody))
+	if err != nil {
+		return "", fmt.Errorf("creating repost request: %w", err)
+	}
+
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+c.accessJwt)
+
+	resp, err := c.httpClient.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("performing repost request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("repost creation failed with status %d: %s", resp.StatusCode, body)
+	}
+
+	var repostResp struct {
+		Uri string `json:"uri"`
+		Cid string `json:"cid"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&repostResp); err != nil {
+		return "", fmt.Errorf("decoding repost response: %w", err)
+	}
+
+	return repostResp.Uri + "|" + repostResp.Cid, nil
+}
