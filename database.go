@@ -169,3 +169,81 @@ func (d *Database) SaveLastCheckTime(t time.Time) error {
 	)
 	return err
 }
+
+func (d *Database) GetRecentPostsToCheckForEdits(maxCount int) ([]string, error) {
+	rows, err := d.db.Query(
+		"SELECT mastodon_id FROM post_mappings ORDER BY created_at DESC LIMIT ?",
+		maxCount,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+
+	return ids, nil
+}
+
+// Add this to track the last edit time for a post
+func (d *Database) SaveLastEditTime(postID string, editTime time.Time) error {
+	_, err := d.db.Exec(
+		"INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+		"edit_time_"+postID, editTime.Format(time.RFC3339),
+	)
+	return err
+}
+
+func (d *Database) GetLastEditTime(postID string) (time.Time, error) {
+	var timeStr string
+	err := d.db.QueryRow(
+		"SELECT value FROM state WHERE key = ?",
+		"edit_time_"+postID,
+	).Scan(&timeStr)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+
+	t, err := time.Parse(time.RFC3339, timeStr)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	return t, nil
+}
+
+func (d *Database) SaveContentHash(postID string, contentHash string) error {
+	_, err := d.db.Exec(
+		"INSERT OR REPLACE INTO state (key, value) VALUES (?, ?)",
+		"content_hash_"+postID, contentHash,
+	)
+	return err
+}
+
+func (d *Database) GetContentHash(postID string) (string, error) {
+	var hash string
+	err := d.db.QueryRow(
+		"SELECT value FROM state WHERE key = ?",
+		"content_hash_"+postID,
+	).Scan(&hash)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+
+	return hash, nil
+}

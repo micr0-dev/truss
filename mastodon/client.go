@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/mattn/go-mastodon"
 	"github.com/microcosm-cc/bluemonday"
@@ -34,6 +35,9 @@ type Post struct {
 	Hashtags    []string
 	EditedAt    time.Time
 	OriginalID  string
+	Username    string
+	Instance    string
+	DisplayName string
 }
 
 func NewClient(config ClientConfig) (*Client, error) {
@@ -98,9 +102,11 @@ func (c *Client) GetNewPosts(ctx context.Context, sinceID string, sinceTime time
 			hashtags = append(hashtags, tag.Name)
 		}
 
+		isReply := status.InReplyToID != ""
+
 		post := &Post{
 			ID:         string(status.ID),
-			Content:    cleanHTML(status.Content, hashtags),
+			Content:    cleanHTML(status.Content, hashtags, isReply),
 			Visibility: status.Visibility,
 			CreatedAt:  status.CreatedAt,
 			InReplyToID: func() string {
@@ -126,9 +132,11 @@ func (c *Client) GetNewPosts(ctx context.Context, sinceID string, sinceTime time
 				reblogHashtags = append(reblogHashtags, tag.Name)
 			}
 
+			reblogIsReply := status.Reblog.InReplyToID != ""
+
 			post.Reblog = &Post{
 				ID:         string(status.Reblog.ID),
-				Content:    cleanHTML(status.Reblog.Content, reblogHashtags),
+				Content:    cleanHTML(status.Reblog.Content, reblogHashtags, reblogIsReply),
 				Visibility: status.Reblog.Visibility,
 				CreatedAt:  status.Reblog.CreatedAt,
 				InReplyToID: func() string {
@@ -150,7 +158,7 @@ func (c *Client) GetNewPosts(ctx context.Context, sinceID string, sinceTime time
 }
 
 // cleanHTML removes HTML tags and converts HTML entities
-func cleanHTML(input string, hashtags []string) string {
+func cleanHTML(input string, hashtags []string, isReply bool) string {
 	// Use bluemonday to strip HTML tags safely
 	p := bluemonday.StripTagsPolicy()
 
@@ -181,6 +189,31 @@ func cleanHTML(input string, hashtags []string) string {
 		clean = strings.ReplaceAll(clean, "#"+tag, "")
 	}
 
+	// If this is a reply, remove leading mentions
+	if isReply {
+		// Split by lines to handle each paragraph
+		lines := strings.Split(clean, "\n")
+		for i, line := range lines {
+			// Only apply to lines that start with mentions
+			trimmedLine := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmedLine, "@") {
+				// Handle leading mentions, possibly with punctuation
+				pattern := regexp.MustCompile(`^(@[\w\.-]+(?:@[\w\.-]+)?[\s,:;]?)+\s*`)
+				lines[i] = pattern.ReplaceAllString(line, "")
+
+				// Capitalize first letter of remaining text if needed
+				if len(lines[i]) > 0 {
+					runes := []rune(lines[i])
+					if unicode.IsLetter(runes[0]) && unicode.IsLower(runes[0]) {
+						runes[0] = unicode.ToUpper(runes[0])
+						lines[i] = string(runes)
+					}
+				}
+			}
+		}
+		clean = strings.Join(lines, "\n")
+	}
+
 	// Clean up multiple newlines
 	re := regexp.MustCompile(`\n{3,}`)
 	clean = re.ReplaceAllString(clean, "\n\n")
@@ -204,46 +237,67 @@ func (c *Client) GetAccount(ctx context.Context) (*mastodon.Account, error) {
 	return account, nil
 }
 
-func (c *Client) CheckForEdits(ctx context.Context, postIDs []string, since time.Time) (map[string]*Post, error) {
-	edits := make(map[string]*Post)
+func (c *Client) GetPostWithEdits(ctx context.Context, postID string) (*Post, error) {
+	status, err := c.client.GetStatus(ctx, mastodon.ID(postID))
+	if err != nil {
+		return nil, fmt.Errorf("getting status: %w", err)
+	}
 
-	// For each post we've already bridged, check if it's been edited
-	for _, id := range postIDs {
-		status, err := c.client.GetStatus(ctx, mastodon.ID(id))
-		if err != nil {
-			log.Printf("Could not check status %s for edits: %v", id, err)
-			continue
-		}
+	var hashtags []string
+	for _, tag := range status.Tags {
+		hashtags = append(hashtags, tag.Name)
+	}
 
-		// If the post has been edited since we last checked
-		if !status.EditedAt.IsZero() && status.EditedAt.After(since) {
-			// This post has been edited
-			var hashtags []string
-			for _, tag := range status.Tags {
-				hashtags = append(hashtags, tag.Name)
+	// Extract username and instance from account
+	username := status.Account.Username
+	instance := extractInstanceFromAcct(status.Account.Acct, c.client.Config.Server)
+	displayName := status.Account.DisplayName
+
+	// Check if this is a reply
+	isReply := status.InReplyToID != ""
+
+	post := &Post{
+		ID:         string(status.ID),
+		Content:    cleanHTML(status.Content, hashtags, isReply),
+		Visibility: status.Visibility,
+		CreatedAt:  status.CreatedAt,
+		InReplyToID: func() string {
+			if id, ok := status.InReplyToID.(string); ok {
+				return id
 			}
+			return ""
+		}(),
+		Hashtags:    hashtags,
+		Username:    username,
+		Instance:    instance,
+		DisplayName: displayName,
+	}
 
-			post := &Post{
-				ID:         string(status.ID),
-				Content:    cleanHTML(status.Content, hashtags),
-				Visibility: status.Visibility,
-				CreatedAt:  status.CreatedAt,
-				InReplyToID: func() string {
-					if status.InReplyToID != nil {
-						if id, ok := status.InReplyToID.(string); ok {
-							return id
-						}
-					}
-					return ""
-				}(),
-				Hashtags:   hashtags,
-				EditedAt:   status.EditedAt,
-				OriginalID: string(status.ID), // Same ID for edits in Mastodon
-			}
+	// Rest of the function remains the same
+	return post, nil
+}
 
-			edits[string(status.ID)] = post
+func extractInstanceFromAcct(acct string, defaultServer string) string {
+	// If it contains @, it's likely a remote account
+	if strings.Contains(acct, "@") {
+		parts := strings.Split(acct, "@")
+		if len(parts) >= 2 {
+			return parts[1]
 		}
 	}
 
-	return edits, nil
+	// For local accounts, extract from the server URL
+	server := defaultServer
+	if strings.HasPrefix(server, "https://") {
+		server = server[8:]
+	} else if strings.HasPrefix(server, "http://") {
+		server = server[7:]
+	}
+
+	// Remove any path
+	if slash := strings.IndexByte(server, '/'); slash != -1 {
+		server = server[:slash]
+	}
+
+	return server
 }

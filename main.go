@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -105,29 +107,24 @@ func (b *Bridge) Run(ctx context.Context) error {
 		log.Printf("Couldn't get last seen ID, starting from scratch: %v", err)
 	}
 
-	// Get last time we checked for edits
-	lastEditCheck, err := b.db.GetLastCheckTime()
-	if err != nil {
-		log.Printf("Couldn't get last edit check time: %v", err)
-		lastEditCheck = time.Now()
-	}
-
 	// Start time for this run
 	startTime := time.Now()
 
-	newPostTicker := time.NewTicker(time.Duration(b.config.PollInterval) * time.Second)
-	defer newPostTicker.Stop()
+	// Create a ticker for normal post polling
+	postTicker := time.NewTicker(time.Duration(b.config.PollInterval) * time.Second)
+	defer postTicker.Stop()
 
-	// Check for edits less frequently (e.g., every 5 minutes)
-	editCheckTicker := time.NewTicker(5 * time.Minute)
-	defer editCheckTicker.Stop()
+	// Create a ticker for edit checking
+	editTicker := time.NewTicker(time.Duration(b.config.PollInterval) * time.Second * 2)
+	defer editTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 
-		case <-newPostTicker.C:
+		case <-postTicker.C:
+			log.Println("Checking for new posts...")
 			// Handle new posts
 			posts, err := b.mastodon.GetNewPosts(ctx, lastID, startTime)
 			if err != nil {
@@ -153,46 +150,44 @@ func (b *Bridge) Run(ctx context.Context) error {
 				}
 			}
 
-		case <-editCheckTicker.C:
-			// Check for edits to existing posts
-			log.Println("Checking for edits to existing posts...")
-
-			// Get all posts we've bridged
-			bridgedIDs, err := b.db.GetBridgedPostIDs()
+		case <-editTicker.C:
+			log.Println("Checking for post edits...")
+			// Check for edits (only check the 10 most recent posts)
+			recentIDs, err := b.db.GetRecentPostsToCheckForEdits(10)
 			if err != nil {
-				log.Printf("Error getting bridged post IDs: %v", err)
+				log.Printf("Error getting recent posts to check: %v", err)
 				continue
 			}
 
-			if len(bridgedIDs) == 0 {
-				continue
-			}
+			for _, id := range recentIDs {
+				post, err := b.mastodon.GetPostWithEdits(ctx, id)
+				if err != nil {
+					log.Printf("Error checking post %s for edits: %v", id, err)
+					continue
+				}
 
-			// Check for edits
-			edits, err := b.mastodon.CheckForEdits(ctx, bridgedIDs, lastEditCheck)
-			if err != nil {
-				log.Printf("Error checking for edits: %v", err)
-				continue
-			}
+				// Calculate new content hash
+				newContentHash := hashPostContent(post.Content)
 
-			if len(edits) > 0 {
-				log.Printf("Found %d edited posts", len(edits))
+				// Get the stored hash
+				oldContentHash, err := b.db.GetContentHash(id)
+				if err != nil {
+					log.Printf("Error getting content hash for post %s: %v", id, err)
+					continue
+				}
 
-				for _, post := range edits {
-					log.Printf("Processing edit for post %s (edited at %s)",
-						post.ID, post.EditedAt.Format(time.RFC3339))
+				// Only process if content actually changed
+				if newContentHash != oldContentHash {
+					log.Printf("Content changed for post %s (hash: %s -> %s), reprocessing",
+						id, oldContentHash[:8], newContentHash[:8])
+
+					// Process the updated post
 					if err := b.ProcessPost(ctx, post); err != nil {
-						log.Printf("Error processing edited post %s: %v", post.ID, err)
+						log.Printf("Error processing edited post %s: %v", id, err)
+						continue
 					}
 				}
 			}
-
-			// Update the last check time
-			if err := b.db.SaveLastCheckTime(time.Now()); err != nil {
-				log.Printf("Error saving last edit check time: %v", err)
-			}
-
-			lastEditCheck = time.Now()
 		}
 	}
 }
@@ -226,15 +221,44 @@ func (b *Bridge) ProcessPost(ctx context.Context, post *mastodon.Post) error {
 		}
 	}
 
-	// Handle reply to our own post
+	// Calculate content hash
+	contentHash := hashPostContent(post.Content)
+
+	// Check if we've already processed this exact content
+	existingHash, err := b.db.GetContentHash(post.ID)
+	if err == nil && existingHash == contentHash {
+		log.Printf("Post %s content unchanged (hash: %s), skipping", post.ID, contentHash[:8])
+		return nil
+	}
+
+	// If we're here, either it's a new post or the content has changed
+	if existingHash != "" {
+		log.Printf("Post %s content changed (hash: %s -> %s), reprocessing",
+			post.ID, existingHash[:8], contentHash[:8])
+
+		// Delete any existing posts for this ID
+		bskyIDs, err := b.db.GetBlueskyIDsForMastodonPost(post.ID)
+		if err == nil && len(bskyIDs) > 0 {
+			log.Printf("Found %d existing Bluesky posts to delete", len(bskyIDs))
+
+			// Delete all previous posts
+			for _, id := range bskyIDs {
+				if err := b.bluesky.DeletePost(ctx, id); err != nil {
+					log.Printf("Error deleting Bluesky post %s: %v", id, err)
+				}
+			}
+		}
+	}
+
+	// Handle reply to our own post or another bridged post
 	var parentUri, parentCid string
 
 	if post.InReplyToID != "" {
-		// Check if we've bridged the parent post
+		// First, check if we've bridged the parent post ourselves
 		parentBskyIDs, err := b.db.GetBlueskyIDsForMastodonPost(post.InReplyToID)
 		if err == nil && len(parentBskyIDs) > 0 {
 			// We found the parent post, this is a reply to our own post
-			log.Printf("Post %s is a reply to our own post %s", post.ID, post.InReplyToID)
+			log.Printf("Post %s is a reply to our own bridged post %s", post.ID, post.InReplyToID)
 
 			// Get the last part of the parent thread
 			lastParentID := parentBskyIDs[len(parentBskyIDs)-1]
@@ -243,38 +267,43 @@ func (b *Bridge) ProcessPost(ctx context.Context, post *mastodon.Post) error {
 				parentUri = parts[0]
 				parentCid = parts[1]
 			}
-		}
-	}
-
-	// Check if this is an edit
-	origPostID, isEdit := b.db.CheckIfEdit(post.ID, post.OriginalID)
-	if isEdit {
-		log.Printf("Post %s is an edit of %s, deleting previous posts", post.ID, origPostID)
-
-		// Get all Bluesky posts for the original Mastodon post
-		bskyIDs, err := b.db.GetBlueskyIDsForMastodonPost(origPostID)
-		if err != nil {
-			log.Printf("Error getting Bluesky IDs for edited post: %v", err)
 		} else {
-			// Delete all previous Bluesky posts for this Mastodon post
-			for _, id := range bskyIDs {
-				parsedID := id
-				parts := strings.Split(id, "|")
-				if len(parts) > 0 {
-					// Extract the URI from the combined ID
-					uriParts := strings.Split(parts[0], "/")
-					if len(uriParts) >= 4 {
-						parsedID = uriParts[len(uriParts)-1]
-					}
-				}
+			// We haven't bridged this post - try to find it on Mastodon
+			parentPost, err := b.mastodon.GetPostWithEdits(ctx, post.InReplyToID)
+			if err != nil {
+				log.Printf("Error getting parent post %s: %v", post.InReplyToID, err)
+			} else {
+				if parentPost.Username != "" && parentPost.Instance != "" {
+					// Look up this post on Bluesky via our more robust method
+					log.Printf("Looking for parent post %s by %s@%s (%s) on Bluesky",
+						post.InReplyToID, parentPost.Username, parentPost.Instance, parentPost.DisplayName)
 
-				if err := b.bluesky.DeletePost(ctx, parsedID); err != nil {
-					log.Printf("Error deleting Bluesky post %s: %v", parsedID, err)
+					parentUri, parentCid, err = b.bluesky.LookupBridgedMastodonPost(
+						ctx,
+						post.InReplyToID,
+						parentPost.Username,
+						parentPost.Instance,
+						parentPost.Content,
+						parentPost.DisplayName,
+						parentPost.CreatedAt)
+
+					if err != nil {
+						log.Printf("Could not find parent post on Bluesky: %v", err)
+						// If we can't find the parent post, should we skip this post?
+						log.Printf("Skipping post %s as we can't find the parent", post.ID)
+						return nil
+					}
+
+					log.Printf("Found parent post on Bluesky: %s", parentUri)
 				}
 			}
 		}
 
-		// We'll create new posts below with the updated content
+		// If we still haven't found a parent, we should skip this post
+		if parentUri == "" {
+			log.Printf("Skipping post %s as we can't find the parent post to reply to", post.ID)
+			return nil
+		}
 	}
 
 	// Split content if needed and post to Bluesky
@@ -343,16 +372,13 @@ func (b *Bridge) ProcessPost(ctx context.Context, post *mastodon.Post) error {
 	}
 
 	// Store the mapping in the database
-	// For edits, we store the mapping under the new post ID
 	if err := b.db.SavePostMapping(post.ID, bskyIDs); err != nil {
 		log.Printf("Error saving post mapping: %v", err)
 	}
 
-	// If this was an edit, also update the mapping for the original post
-	if isEdit && origPostID != post.ID {
-		if err := b.db.SavePostMapping(origPostID, bskyIDs); err != nil {
-			log.Printf("Error updating original post mapping: %v", err)
-		}
+	// Store the content hash
+	if err := b.db.SaveContentHash(post.ID, contentHash); err != nil {
+		log.Printf("Error saving content hash: %v", err)
 	}
 
 	return nil
@@ -436,4 +462,11 @@ func splitContent(content string) []string {
 	}
 
 	return parts
+}
+
+// hashPostContent creates a consistent hash of post content
+func hashPostContent(content string) string {
+	hasher := sha256.New()
+	hasher.Write([]byte(content))
+	return hex.EncodeToString(hasher.Sum(nil))
 }
